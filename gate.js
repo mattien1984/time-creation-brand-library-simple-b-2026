@@ -13,6 +13,44 @@
   let attempt=0,debounce,entryDownload;
   const setState=state=>{pill.dataset.state=state;pill.setAttribute('aria-busy',String(state==='checking'||state==='preparing'));};
   const isCurrent=id=>id===attempt;
+  function entryDestination() {
+    const current=new URL(location.pathname+(location.search||'')+(location.hash||''),location.origin);
+    if(!current.pathname.startsWith(VAULT.base))return new URL(VAULT.base,location.origin);
+    if(current.pathname!==VAULT.base+'gate.html')return current;
+    const returnTo=current.searchParams.get('returnTo');
+    if(returnTo) {
+      try {
+        const target=new URL(returnTo,location.origin);
+        if(target.origin===location.origin&&target.pathname.startsWith(VAULT.base)&&target.pathname!==VAULT.base+'gate.html')return target;
+      } catch {}
+      return new URL(VAULT.base,location.origin);
+    }
+    current.pathname=VAULT.base;return current;
+  }
+  function refreshGate(version) {
+    const current=new URL(location.pathname+(location.search||''),location.origin);
+    if(current.pathname===VAULT.base+'gate.html'&&current.searchParams.get('_refresh')==='1')throw failure('VERSION','This preview is still updating. Reload in a moment and try again.');
+    const target=entryDestination(),gate=new URL(VAULT.base+'gate.html',location.origin);
+    gate.searchParams.set('v',version);gate.searchParams.set('_refresh','1');
+    gate.searchParams.set('returnTo',target.pathname+target.search+target.hash);
+    field.readOnly=true;verify.disabled=true;setState('updating');progress('Opening the current library…');
+    location.replace(gate.pathname+gate.search+gate.hash);
+  }
+  async function currentManifest() {
+    const controller=new AbortController();
+    try {
+      return await bounded((async()=>{
+        const response=await fetch(VAULT.base+'vault-config.js?check='+Date.now(),{cache:'no-store',signal:controller.signal});
+        if(!response.ok)throw failure('NET','The current preview could not be checked. Please try again.');
+        const source=await response.text(),match=/^self\.VAULT\s*=\s*(\{[\s\S]*\})\s*;?\s*$/.exec(source);
+        if(!match)throw failure('VERSION','The current preview could not be checked. Please reload.');
+        const latest=JSON.parse(match[1]);
+        if(typeof latest.version!=='string'||!latest.version||latest.base!==VAULT.base)throw failure('VERSION','The current preview could not be checked. Please reload.');
+        return latest;
+      })(),8000,'NET','The preview update check took too long. Please try again.');
+    } catch(error){if(!error.code)throw failure('NET','The current preview could not be checked. Please try again.');throw error;}
+    finally {controller.abort();}
+  }
   function downloadEntry(){
     if(!entryDownload)entryDownload=encryptedEntry().catch(error=>{entryDownload=undefined;throw error;});
     return entryDownload;
@@ -23,7 +61,7 @@
     try {
       return await bounded((async()=>{
         const response=await fetch(VAULT.base+'.sealed/'+item.file,{cache:'force-cache',signal:controller.signal});
-        if(!response.ok)throw failure('NET',response.status===404?'This preview was updated. Reload this page and try again.':'The secure preview file could not be downloaded. Please try again.');
+        if(!response.ok)throw failure(response.status===404?'STALE':'NET',response.status===404?'This preview was updated. Reload this page and try again.':'The secure preview file could not be downloaded. Please try again.');
         return response.arrayBuffer();
       })(),15000,'NET','The secure preview download timed out. Please try again.');
     } catch(error) {if(!error.code)throw failure('NET','The secure preview could not connect. Please try again.');throw error;}
@@ -65,6 +103,9 @@
     if(explicit)progress('Checking password…');
     let keyBytes;
     try {
+      const latest=await currentManifest();
+      if(!isCurrent(id))return;
+      if(latest.version!==VAULT.version){refreshGate(latest.version);return;}
       if(!crypto.subtle)throw failure('CRYPTO','Open this preview in an updated browser.');
       // Verify locally against the encrypted entry. The password never leaves
       // the page; edits invalidate older attempts before they can unlock it.
@@ -83,7 +124,7 @@
       progress('Preparing the library…');
       const worker=await prepare();
       const hello=await contact(worker,{type:'ping',version:VAULT.version},[],'HANDSHAKE');
-      if(!hello.ok||hello.version!==VAULT.version)throw failure('VERSION','This preview was updated. Reload this page and try again.');
+      if(!hello.ok||hello.version!==VAULT.version)throw failure('STALE','This preview was updated. Reload this page and try again.');
       const response=await contact(worker,{type:'unlock',keyBytes,ciphertext,version:VAULT.version},[keyBytes,ciphertext],'OPEN');
       if(!response.ok)throw failure(response.code||'OPEN',response.error||'The library could not open. Please try again.');
       const shouldFocus=document.activeElement===field||document.activeElement===verify;
@@ -94,6 +135,15 @@
       if(shouldFocus)button.focus({preventScroll:true});
     } catch(error) {
       if(!isCurrent(id))return;
+      if(error.code==='STALE'||error.code==='VERSION') {
+        try {
+          const latest=await currentManifest();
+          if(!isCurrent(id))return;
+          if(latest.version!==VAULT.version){refreshGate(latest.version);return;}
+        } catch(updateError){error=updateError;}
+        if(!isCurrent(id))return;
+        if(error.code==='STALE')error=failure('VERSION','This preview was updated. Reload this page and try again.');
+      }
       setState('password');field.readOnly=false;verify.disabled=false;
       const code=error.code||'OPEN';
       // Partial typing is not an error; report a mismatch only on submission.
@@ -115,7 +165,7 @@
     const directGate=location.pathname===VAULT.base+'gate.html';
     // Fetch the unlocked document while preserving the requested route. The
     // library no longer contains a second intro or a dismissible auth overlay.
-    if(directGate)location.replace(VAULT.base+(location.search||'')+(location.hash||''));
+    if(directGate){const target=entryDestination();location.replace(target.pathname+target.search+target.hash);}
     else if(location.pathname.startsWith(VAULT.base))location.reload();
     else location.replace(VAULT.base);
   });
